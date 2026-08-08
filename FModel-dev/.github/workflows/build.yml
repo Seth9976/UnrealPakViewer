@@ -1,0 +1,39 @@
+name: FModel Build (win-x64)  
+  
+on:  
+  workflow_dispatch:  
+    inputs:  
+      appVersion:  
+        description: 'FModel Version'  
+        required: true  
+        default: '4.4.4.0'  
+  
+jobs:  
+  build:  
+    runs-on: windows-2022  
+  
+    steps:  
+      - name: Checkout with Submodules  
+        uses: actions/checkout@v4  
+        with:  
+          submodules: 'recursive'  
+  
+      - name: Setup .NET 8  
+        uses: actions/setup-dotnet@v4  
+        with:  
+          dotnet-version: '8.0.x'  
+  
+      - name: Show dotnet info  
+        run: dotnet --info  
+  
+      - name: Show project target framework  
+        run: Select-String -Path "./FModel/FModel.csproj" -Pattern "TargetFramework"  
+  
+      - name: Publish win-x64  
+        run: dotnet publish "./FModel/FModel.csproj" -c Release --no-self-contained -r win-x64 -o "./FModel/bin/Publish/" -p:PublishReadyToRun=false -p:PublishSingleFile=true -p:DebugType=None -p:GenerateDocumentationFile=false -p:DebugSymbols=false -p:AssemblyVersion=${{ github.event.inputs.appVersion }} -p:FileVersion=${{ github.event.inputs.appVersion }}  
+  
+      - name: Upload Artifact  
+        uses: actions/upload-artifact@v4  
+        with:  
+          name: FModel-win-x64  
+          path: ./FModel/bin/Publish/FModel.exe
