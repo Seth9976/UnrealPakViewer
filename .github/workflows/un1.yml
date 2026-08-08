@@ -1,0 +1,127 @@
+# 用途：
+# 本配置文件用于在 GitHub Actions 持续集成工作流中自动扫描、解包并清理压缩数据文件。
+# 它整合了前期分析出的两个核心修复点：
+# 1. 显式授予了 contents 和 workflows 的 write 权限，确保后续解压产生的新建 .github/workflows/ 工作流文件可以合法推送到远端仓库。
+# 2. 启用了 lfs: true，防止解压出的 .dll 等二进制文件触发目标仓库预期的 LFS 跟踪规则并导致推送被预接收钩子（pre-receive hook）拦截。
+# 执行体包含了一个内联的自动化 Bash 脚本，实现无缝强制解包、目录树整合、空目录垃圾清理以及具备重试抗压机制的 Git 事务提交。
+
+name: 自动化归档提取与合并
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '**.zip'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  workflows: write # 关键修复点一：必须显式授权修改工作流文件的权限
+
+jobs:
+  extract-and-commit:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 检出当前仓库代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true # 关键修复点二：确保 LFS 大文件能够被正确识别处理
+
+      - name: 扫描执行解包与状态提交
+        run: |
+          # 用途：
+          # 此脚本层用于自动化扫描当前工作区（严格排除 .git 目录）中的所有 .zip 归档文件。
+          # 通过 unzip -o 强制执行无提示覆盖与解包，天然支持将解压出的包括 .github 在内的目录树无缝合并入现有路径。
+          # 提取完成后，自动移除原始归档及残留的空目录节点，并在计算修改增量后构建带有详细统计信息的 Git 提交流。
+          # 引入了针对不可预知推送冲突（如分支更新竞态条件）的 3 次重试自愈逻辑。
+
+          set -euo pipefail
+
+          # 收集所有符合条件的 .zip 文件映射至数组（跳过核心控制目录 .git）
+          mapfile -t zips < <(find . -not -path './.git/*' -name '*.zip' -type f | sort)
+
+          if [[ ${#zips[@]} -eq 0 ]]; then
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            echo "::notice::未检测到待处理的 .zip 归档，终止当前作业环节。"
+            exit 0
+          fi
+
+          echo "count=${#zips[@]}" >> "$GITHUB_OUTPUT"
+          echo "::notice::载入 ${#zips[@]} 个压缩分卷，开始解包流水线..."
+
+          success=0
+          failed=0
+          deleted=0
+
+          for zip_path in "${zips[@]}"; do
+            dest_dir="$(dirname "$zip_path")"
+            zip_name="$(basename "$zip_path")"
+
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "📦 提取: $zip_path"
+            echo "   释放至: $dest_dir/"
+
+            # 预检压缩包头与块结构的完整性
+            if ! unzip -t "$zip_path" > /dev/null 2>&1; then
+              echo "::error::归档校验未通过（损坏或不完整），跳过该文件: $zip_path"
+              ((failed++)) || true
+              continue
+            fi
+
+            # 执行强制静默解压机制（-o 物理级覆盖文件内容并逻辑融合目录结构）
+            if unzip -o -q "$zip_path" -d "$dest_dir"; then
+              echo "   ✅ 解包操作完成，内部树形结构与文件节点已对齐覆盖"
+              ((success++)) || true
+              rm -f "$zip_path"
+              ((deleted++)) || true
+            else
+              echo "::error::解包 IO 流执行失败，请审查系统权限及文件占用: $zip_path"
+              ((failed++)) || true
+            fi
+          done
+
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📊 状态汇总: 提取成功 ${success}, 校验失败 ${failed}, 回收 ${deleted}"
+          echo "success=$success" >> "$GITHUB_OUTPUT"
+          echo "failed=$failed"   >> "$GITHUB_OUTPUT"
+          echo "deleted=$deleted" >> "$GITHUB_OUTPUT"
+
+          # 递归清除无用的底层空树节点
+          find . -not -path './.git/*' -type d -empty -delete 2>/dev/null || true
+
+          # 构建机器用户的 Git 提交上下文环境
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 将当前工作区所有改动（含新加入的工作流 YAML 和 LFS dll 对象）载入暂存区
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "::notice::暂存区无物理文件哈希变化，舍弃提交阶段。"
+            exit 0
+          fi
+
+          # 计算代码变更净行数
+          added=$(git diff --cached --numstat | awk '{s+=$1} END{print s+0}')
+          removed=$(git diff --cached --numstat | awk '{s+=$2} END{print s+0}')
+
+          git commit -m "auto: extract ${deleted} zip archive(s)" \
+                     -m "自动化解包: ${success} 成功, ${failed} 失败" \
+                     -m "清理归档: ${deleted} 个实体资源" \
+                     -m "增量变动: 新增 ${added} 行, 移除 ${removed} 行"
+
+          # 引入重试自适应机制执行推送指令，抵御由于工作流并发运行产生的远端分支更新
+          for attempt in 1 2 3; do
+            if git push; then
+              echo "✅ 工作区变动已成功同步至上游节点"
+              exit 0
+            fi
+            echo "::warning::向上游同步受阻。触发原因可能系并发覆盖或预接收钩子拒绝。当前触发第 ${attempt} 次容错重试..."
+            git pull --rebase --autostash
+            sleep $((attempt * 2))
+          done
+
+          echo "::error::事务级容错重试已耗尽，链路阻塞断开。"
+          exit 1
